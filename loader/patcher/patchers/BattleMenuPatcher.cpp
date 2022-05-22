@@ -34,10 +34,8 @@ bool BattleMenuPatcher::DoPatchwork(std::string fileName, std::string& fileData)
 		ordered_json& regularLayout = findChild(root, "entity_name", "regular_layout");
 
 		ordered_json& rankedButton = findChild(regularLayout, "entity_name", "ranked_button_root");
-		rankedButton = json(nullptr);
 
 		ordered_json& casualButton = findChild(regularLayout, "entity_name", "casual_button_root");
-		casualButton = json(nullptr);
 
 		fileData = file.dump();
 		Logger::Print<Logger::SUCCESS>("Patched battle screen properly!");
