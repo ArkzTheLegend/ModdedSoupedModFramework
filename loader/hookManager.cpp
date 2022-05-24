@@ -6,7 +6,8 @@
 #include <ZipCpp.h>
 #include <Bin2.h>
 #include "dumper/dumper.h"
-#include <patchers.h>
+#include "patcher/patchers.h"
+#include "patcher/overrides.h"
 
 #include <Windows.h>
 #include <stack>
@@ -17,38 +18,43 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <Profile.h>
+#include "ui/ui.h"
+#include <ShlObj_core.h>
 
-std::stack<std::string> patchworkStack;
 std::mutex patchworkMutex;
+std::stack<std::array<std::string, 2>> patchworkStack;
 static bool initUi = false;
 
 static PLH::x64Detour* plhDecompressFile;
 static uint64_t oDecompressFile = Memory::FindSig(Soup::Signatures::SIG_ZIPCPP_DECOMPRESSFILE);
-void* hkDecompressFile(Soup::ZipIterator* pZipIterator, char* lpReadBuffer, uint32_t bufferSize) {
+void* hkDecompressFile(Soup::ZipReader* pZipReader) {
+	Soup::ZipIterator* pZipIterator = pZipReader->pZipIterator;
+	char* pReadBuffer = (char*)pZipReader->pReadBuffer;
+	uint32_t bufferSize = pZipReader->bufferSize;
 	//Get the bundle (.jet) file path
 	std::filesystem::path bundlePath = pZipIterator->psArchivePath->cpp_str();
 	//Get the bundle information
 	Soup::ZipEntry* bundleData = pZipIterator->pZipEntry;
 	//Get the entry & path for the current file
 	std::string fileName = bundleData->GetName().cpp_str();
-	void* ret = PLH::FnCast(oDecompressFile, hkDecompressFile)(pZipIterator, lpReadBuffer, bufferSize);
+	void* ret = PLH::FnCast(oDecompressFile, hkDecompressFile)(pZipReader);
 	Logger::Debug("Decompressed {}", fileName);
 
 	static char bin2_header[] = "%BIN_2.0";
 	static char jpng_header[] = "%JPNG001";
-	if (memcmp(bin2_header, lpReadBuffer, sizeof(bin2_header) - 1) == 0)
+	if (memcmp(bin2_header, pReadBuffer, sizeof(bin2_header) - 1) == 0)
 	{
 		Logger::Debug("{} IS BIN2 encrypted", fileName);
-		Dumper::DumpToDisk(fileName, bundlePath, std::string(lpReadBuffer, bufferSize));
+		Dumper::DumpToDisk(fileName, bundlePath, std::string(pReadBuffer, bufferSize));
 		patchworkMutex.lock();
-		patchworkStack.push(fileName);
+		patchworkStack.push(std::array<std::string, 2>{bundlePath.filename().string(), fileName});
 		patchworkMutex.unlock();
 		return ret;
 	}
-	if (memcmp(jpng_header, lpReadBuffer, sizeof(jpng_header) - 1) == 0)
+	if (memcmp(jpng_header, pReadBuffer, sizeof(jpng_header) - 1) == 0)
 	{
 		Logger::Debug("{} IS JPNG format", fileName);
-		Dumper::DumpToDisk(fileName, bundlePath, std::string(lpReadBuffer, bufferSize));
+		Dumper::DumpToDisk(fileName, bundlePath, std::string(pReadBuffer, bufferSize));
 		return ret;
 	}
 	Logger::Debug("{} is not BIN2 nor JPNG format", fileName);
@@ -57,7 +63,8 @@ void* hkDecompressFile(Soup::ZipIterator* pZipIterator, char* lpReadBuffer, uint
 
 static PLH::x64Detour* plhDecryptBytes;
 static uint64_t oDecryptBytes = Memory::FindSig(Soup::Signatures::SIG_BIN2_DECRYPTBYTES);
-void* hkDecryptBytes(uint8_t** bytes) {
+static auto fnResizeBuffer = (void(__fastcall*)(void**, long long))Memory::FindSig(Soup::Signatures::SIG_BIN2_RESIZEBUFFER);
+void* hkDecryptBytes(Soup::ArrayList<uint8_t>* bytes) {
 	void* result = PLH::FnCast(oDecryptBytes, hkDecryptBytes)(bytes);
 
 	patchworkMutex.lock();
@@ -67,7 +74,9 @@ void* hkDecryptBytes(uint8_t** bytes) {
 		return result;
 	}
 	//Get the first file in the stack
-	std::string targetFile = patchworkStack.top();
+	std::array<std::string, 2> targetInfo = patchworkStack.top();
+	std::string targetBundle = targetInfo[0];
+	std::string targetFile = targetInfo[1];
 	//Pop it off the stack when the name is stored
 	patchworkStack.pop();
 
@@ -75,18 +84,21 @@ void* hkDecryptBytes(uint8_t** bytes) {
 	Logger::Debug("Patching {}", targetFile);
 
 	/*Patch the file*/
-	std::string fileContent = std::string(*(char**)bytes, (size_t)(bytes[1] - bytes[0]));
-	Patchers::PatchData(targetFile, fileContent);
+	std::string fileContent = std::string((char*)bytes->at(0), bytes->count());
+	Overrides::RunOverrides(targetBundle, targetFile, fileContent, false);
+	Patchers::PatchData(targetBundle, targetFile, fileContent);
+	Overrides::RunOverrides(targetBundle, targetFile, fileContent, true);
 
 	//Safety checks
-	size_t bufferSize = bytes[1] - bytes[0];
+	size_t bufferSize = bytes->count();
 	if (bufferSize < fileContent.size()) {
 		Logger::Debug("WARNING: There is not enough space allocated to apply this patch!");
+		fnResizeBuffer((void**)bytes, fileContent.size());
 	}
 
 	//Place the patched data back into the buffer
-	memset(bytes[0], 0, bufferSize);
-	memcpy_s(bytes[0], bufferSize, fileContent.c_str(), fileContent.size());
+	memset(bytes->begin(), 0, bytes->count());
+	memcpy_s(bytes->begin(), bytes->count(), fileContent.c_str(), fileContent.size());
 
 	//Print we finished patching
 	Logger::Debug("Patched {}", targetFile);
@@ -133,6 +145,15 @@ bool hkSwapBuffers(HDC hdc, int b) {
 		ImGui::StyleColorsDark();
 		ImGui::CaptureMouseFromApp();
 
+		ImGuiIO& io = ImGui::GetIO();
+		io.Fonts->Clear();
+		char fontsPath[MAX_PATH];
+		SHGetFolderPathA(NULL, CSIDL_FONTS, NULL, NULL, fontsPath);
+		std::string arial_path = std::string(std::string(fontsPath) + "/Calibril.ttf");
+		io.Fonts->AddFontFromFileTTF(arial_path.c_str(), 16);
+		io.Fonts->AddFontFromFileTTF(arial_path.c_str(), 20);
+		io.Fonts->Build();
+
 		initUi = true;
 	}
 
@@ -145,6 +166,8 @@ bool hkSwapBuffers(HDC hdc, int b) {
 	ImGui_ImplOpenGL3_NewFrame();
 	ImGui_ImplWin32_NewFrame();
 	ImGui::NewFrame();
+
+	UI::Render();
 
 	ImGui::Render();
 	ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
