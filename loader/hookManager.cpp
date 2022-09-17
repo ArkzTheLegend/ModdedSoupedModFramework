@@ -159,9 +159,13 @@ void PostDecrypt(char* endPtr, size_t size, char* beginPtr) {
 	patchworkMutex.unlock();
 	return;
 }
-void* hkPostDecrypt(char* endPtr, size_t size, char* beginPtr) {
-	PostDecrypt(endPtr, size, beginPtr);
-	return PLH::FnCast(oPostDecrypt, hkPostDecrypt)(endPtr, size, beginPtr);
+void hkPostDecrypt(char* endPtr, size_t param_2, char* beginPtr) {
+	size_t size = endPtr - beginPtr;
+	Logger::Debug("Size: {}", size);
+	std::string content = std::string(beginPtr, size-8);
+	Logger::Debug("Content: {}", content);
+	//PostDecrypt(endPtr, size, beginPtr);
+	//return;// PLH::FnCast(oPostDecrypt, hkPostDecrypt)(endPtr, size, beginPtr);
 }
 //Derive key
 //?? ?? ?? 71 ?? ?? ?? 33 ?? ?? ?? 0B ?? ?? ?? B5 ?? ?? ?? E5 ?? ?? ?? 23 ?? ?? ?? CF
@@ -331,69 +335,113 @@ bool hkIsUpgradeUnlocked(size_t param_1, size_t param_2, int param_3, int param_
 	return true;
 }
 
-typedef void(*AsmFunc)();
+//The runtime neets to stay alive the entire execution of the program
+//releasing/freeing the runtime will clear the allocated memory for the bootstrap
+using namespace asmjit;
+static JitRuntime runtime;
 bool HookManager::ApplyHooks()
 {
 	Config* config = Config::GetConfig();
 	
 	plhDecompressFile = new PLH::x64Detour(oDecompressFile, (uint64_t)hkDecompressFile, &oDecompressFile);
 	if (!plhDecompressFile->hook()) {
-		Logger::Print<Logger::FAILURE>("Failed to hook ZipCpp::DecompressFile");
+		::Logger::Print<::Logger::FAILURE>("Failed to hook ZipCpp::DecompressFile");
 		return false;
 	}
 	
-	using namespace asmjit;
 	FileLogger logger(stdout);
-	JitRuntime runtime;
-
-	x86::Mem gameExec = x86::ptr(oPostDecrypt);
-	x86::Mem gameRet = x86::ptr(oPostDecrypt+6);
 
 	//Bootstrapper
 	CodeHolder bsCode;
-	bsCode.init(runtime.environment());
 	bsCode.setLogger(&logger);
+	bsCode.init(runtime.environment());
 	x86::Assembler bsAsm(&bsCode);
+
+	size_t hookSize = 10;
+	size_t proxySize = 15;
+	//Useful memory locations
+	uint64_t pLoadAsset = Memory::FindSig(Soup::Signatures::SIG_LOAD_ASSET);
+	uint64_t jmpProxy = pLoadAsset - proxySize;
+	uint64_t hookLoc = oPostDecrypt;
+	uint64_t hookRet = oPostDecrypt + hookSize;
+	Label entryLabel = bsAsm.newLabel();
+	bsAsm.bind(entryLabel);
+
 	//Push registers that need to be saved
-	bsAsm.push(x86::rcx);
 	bsAsm.push(x86::rcx);
 	bsAsm.push(x86::rsi);
 	bsAsm.push(x86::rdi);
-	bsAsm.push(x86::r8 );
+	bsAsm.push(x86::r8);
 	bsAsm.push(x86::r13);
 	bsAsm.push(x86::r15);
 	//Hook code here (call the callback function)
+	bsAsm.call(hkPostDecrypt);
 
 	//Pop registers for returning to game code
-	bsAsm.pop(x86::rcx);
-	bsAsm.pop(x86::rcx);
-	bsAsm.pop(x86::rsi);
-	bsAsm.pop(x86::rdi);
-	bsAsm.pop(x86::r8);
-	bsAsm.pop(x86::r13);
 	bsAsm.pop(x86::r15);
+	bsAsm.pop(x86::r13);
+	bsAsm.pop(x86::r8);
+	bsAsm.pop(x86::rdi);
+	bsAsm.pop(x86::rsi);
+	bsAsm.pop(x86::rcx);
 
 	//Restore to game code
 	bsAsm.mov(x86::rax, x86::rcx);
 	bsAsm.sub(x86::rax, x86::r8);
-	bsAsm.jmp(gameRet);
-	//Create the bootstrap func
-	AsmFunc bs;
-	runtime.add(&bs, &bsCode);
-	
-	//Detour
-	CodeHolder dCode;
-	dCode.setLogger(&logger);
-	dCode.init(runtime.environment());
-	x86::Assembler dAsm(&dCode);
-	Label lD = dAsm.newLabel();
-	dAsm.jmp(bs);
+	bsAsm.lea(x86::rdx, x86::ptr(x86::rax, -0x8));
 
-	//Create detour func (TODO: Write to the game's mem instead)
-	AsmFunc det;
-	runtime.add(&det, &dCode);
+	Label bsAddrPool = bsAsm.newLabel();
+	bsAsm.jmp(x86::ptr(bsAddrPool));
+	bsAsm.bind(bsAddrPool);
+	bsAsm.embedUInt64(hookRet);
+
+	//Create the bootstrap func
+	uint64_t bs;
+	Error err = runtime.add(&bs, &bsCode);
+	if (err) {
+		::Logger::Debug("AsmJit failed: {}", DebugUtils::errorAsString(err));
+		return false;
+	}
+
+	//Proxy jump
+	CodeHolder pjCode;
+	pjCode.init(runtime.environment(), jmpProxy);
+	x86::Assembler pjAsm(&pjCode);
+	Label pjAddrPool = pjAsm.newLabel();
+	pjAsm.jmp(x86::ptr(pjAddrPool));
+	pjAsm.bind(pjAddrPool);
+	pjAsm.embedUInt64(bs);
+
+	//Detour to proxy
+	CodeHolder dCode;
+	dCode.init(runtime.environment(), hookLoc);
+	x86::Assembler dAsm(&dCode);
+	dAsm.jmp(jmpProxy);
+
+	//Unprotect the instructions we have to patch
+	DWORD oldProt;
+	VirtualProtect((LPVOID)hookLoc, hookSize, PAGE_EXECUTE_READWRITE, &oldProt);
+	memset((void*)hookLoc, 0x90, hookSize);
+	VirtualProtect((LPVOID)jmpProxy, proxySize, PAGE_EXECUTE_READWRITE, &oldProt);
+	memset((void*)jmpProxy, 0x90, proxySize);
+
+	//Write the instructions to memory
+	for (Section* section : dCode.sections()) {
+		size_t offset = size_t(section->offset());
+		size_t bufferSize = size_t(section->bufferSize());
+		size_t virtualSize = size_t(section->virtualSize());
+		memcpy((void*)(hookLoc + offset), section->data(), bufferSize);
+	}
+	for (Section* section : pjCode.sections()) {
+		size_t offset = size_t(section->offset());
+		size_t bufferSize = size_t(section->bufferSize());
+		size_t virtualSize = size_t(section->virtualSize());
+		memcpy((void*)(jmpProxy + offset), section->data(), bufferSize);
+	}
+
+	//Output the result
 	::Logger::Debug("Bootstrapper generated here: {}", (void*)bs);
-	::Logger::Debug("Detour generated here: {}", (void*)det);
+	::Logger::Debug("Detour generated here: {}", (void*)hookLoc);
 	std::cin.get();
 
 	/*
